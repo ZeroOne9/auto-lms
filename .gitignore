@@ -6,5 +6,6 @@ env/
 
 config.json
 answer_bank.json
+*.pdf
 
 .env

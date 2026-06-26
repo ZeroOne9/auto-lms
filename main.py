@@ -18,8 +18,12 @@ from pypdf import PdfReader
 
 CONFIG_FILE = Path("config.json")
 ANSWER_BANK_FILE = Path("answer_bank.json")
-REQUIRED_REGIONS = ["question", "A", "B", "C", "D"]
 ANSWER_KEYS = ["A", "B", "C", "D"]
+DEFAULT_START_QUESTION = 1
+ANSWER_INDEX = {"A": 0, "B": 1, "C": 2, "D": 3}
+BLUE_BUTTON_MIN_AREA = 250
+RADIO_GROUP_MIN_COUNT = 2
+REQUIRED_REGIONS = ["question", "A", "B", "C", "D"]
 OPTIONAL_REGIONS = ["submit", "countdown", "popup"]
 OPTIONAL_POINTS = ["next_page", "popup_click"]
 REGION_LABELS = {
@@ -41,6 +45,22 @@ def normalize_text_for_match(text):
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_option_text(text):
+    text = re.sub(r"^\s*[A-Da-d1-4]\s*[\).:\-]\s*", "", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def similarity_score(left, right):
+    left_norm = normalize_text_for_match(left)
+    right_norm = normalize_text_for_match(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    if left_norm in right_norm or right_norm in left_norm:
+        return 0.92
+    return SequenceMatcher(None, left_norm, right_norm).ratio()
 
 
 def extract_question_number(text):
@@ -74,6 +94,140 @@ def parse_countdown_seconds(text):
     if number_match:
         return int(number_match.group(1))
     return None
+
+
+def is_radio_pixel(red, green, blue):
+    near_gray = abs(red - green) < 25 and abs(green - blue) < 25
+    return near_gray and 70 <= red <= 190
+
+
+def is_blue_button_pixel(red, green, blue):
+    return blue >= 140 and green >= 80 and red <= 90 and blue > red + 55
+
+
+def connected_components_from_mask(mask):
+    seen = set()
+    components = []
+    for point in list(mask):
+        if point in seen:
+            continue
+        stack = [point]
+        seen.add(point)
+        xs = []
+        ys = []
+        while stack:
+            x, y = stack.pop()
+            xs.append(x)
+            ys.append(y)
+            for next_x in (x - 1, x, x + 1):
+                for next_y in (y - 1, y, y + 1):
+                    neighbor = (next_x, next_y)
+                    if neighbor in mask and neighbor not in seen:
+                        seen.add(neighbor)
+                        stack.append(neighbor)
+        components.append(
+            {
+                "x1": min(xs),
+                "y1": min(ys),
+                "x2": max(xs),
+                "y2": max(ys),
+                "area": len(xs),
+                "cx": (min(xs) + max(xs)) / 2,
+                "cy": (min(ys) + max(ys)) / 2,
+                "w": max(xs) - min(xs) + 1,
+                "h": max(ys) - min(ys) + 1,
+            }
+        )
+    return components
+
+
+def find_radio_centers(image):
+    width, height = image.size
+    x_start = int(width * float(os.getenv("AUTO_RADIO_X_START_RATIO", "0.18")))
+    x_end = int(width * float(os.getenv("AUTO_RADIO_X_END_RATIO", "0.70")))
+    y_start = int(height * float(os.getenv("AUTO_RADIO_Y_START_RATIO", "0.28")))
+    y_end = int(height * float(os.getenv("AUTO_RADIO_Y_END_RATIO", "0.88")))
+
+    pixels = image.load()
+    mask = set()
+    for y in range(y_start, y_end):
+        for x in range(x_start, x_end):
+            red, green, blue = pixels[x, y]
+            if is_radio_pixel(red, green, blue):
+                mask.add((x, y))
+
+    candidates = []
+    for component in connected_components_from_mask(mask):
+        ratio = component["w"] / max(component["h"], 1)
+        if (
+            10 <= component["w"] <= 34
+            and 10 <= component["h"] <= 34
+            and 0.65 <= ratio <= 1.45
+            and 25 <= component["area"] <= 260
+        ):
+            candidates.append(component)
+
+    groups = []
+    for candidate in sorted(candidates, key=lambda item: item["cx"]):
+        for group in groups:
+            if abs(group["x"] - candidate["cx"]) <= 18:
+                group["items"].append(candidate)
+                group["x"] = sum(item["cx"] for item in group["items"]) / len(group["items"])
+                break
+        else:
+            groups.append({"x": candidate["cx"], "items": [candidate]})
+
+    groups = [
+        group
+        for group in groups
+        if len(group["items"]) >= RADIO_GROUP_MIN_COUNT and width * 0.18 <= group["x"] <= width * 0.45
+    ]
+    if not groups:
+        return []
+
+    best_group = max(groups, key=lambda group: (len(group["items"]), -group["x"]))
+    centers = sorted(
+        [(int(item["cx"]), int(item["cy"])) for item in best_group["items"]],
+        key=lambda point: point[1],
+    )
+
+    filtered = []
+    for center in centers:
+        if not filtered or abs(center[1] - filtered[-1][1]) >= 18:
+            filtered.append(center)
+    return filtered[:4]
+
+
+def find_blue_button_center(image, below_y=0):
+    width, height = image.size
+    x_start = int(width * float(os.getenv("AUTO_BUTTON_X_START_RATIO", "0.45")))
+    x_end = int(width * float(os.getenv("AUTO_BUTTON_X_END_RATIO", "0.98")))
+    y_start = max(int(height * float(os.getenv("AUTO_BUTTON_Y_START_RATIO", "0.35"))), below_y)
+    y_end = int(height * float(os.getenv("AUTO_BUTTON_Y_END_RATIO", "0.93")))
+
+    pixels = image.load()
+    mask = set()
+    for y in range(y_start, y_end):
+        for x in range(x_start, x_end):
+            red, green, blue = pixels[x, y]
+            if is_blue_button_pixel(red, green, blue):
+                mask.add((x, y))
+
+    candidates = []
+    for component in connected_components_from_mask(mask):
+        if (
+            component["area"] >= BLUE_BUTTON_MIN_AREA
+            and 25 <= component["w"] <= 260
+            and 20 <= component["h"] <= 80
+        ):
+            candidates.append(component)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item["cy"] < below_y, abs(item["cy"] - max(below_y, height * 0.70)), item["area"]))
+    best = candidates[0]
+    return int(best["cx"]), int(best["cy"])
 
 
 def extract_pdf_text(pdf_path):
@@ -150,6 +304,7 @@ def parse_color_marked_answer_pdf(pdf_path):
                                 "number": current_question_number,
                                 "question": "",
                                 "answer": answer,
+                                "options": [],
                                 "source": "green_option",
                             }
                         )
@@ -324,6 +479,56 @@ def selected_answer_from_separator_lines(image, separator_lines, start_y, end_y,
     return option_number_to_answer(next(iter(selected_row_indexes)) + 1)
 
 
+def build_answer_row_bounds(separator_lines, start_y, end_y, include_prefirst_row=False):
+    lines = sorted(separator_lines)
+    if not lines:
+        return []
+
+    row_bounds = []
+    if include_prefirst_row and lines[0] - start_y > float(os.getenv("PDF_PRE_FIRST_ROW_MIN_HEIGHT", "35")):
+        row_bounds.append((start_y, lines[0]))
+
+    for row_index, row_start in enumerate(lines):
+        row_end = lines[row_index + 1] if row_index + 1 < len(lines) else end_y
+        row_bounds.append((row_start, row_end))
+    return row_bounds[:4]
+
+
+def ocr_pil_text(image, psm=6):
+    image = image.convert("L")
+    image = ImageOps.autocontrast(image)
+    image = image.filter(ImageFilter.SHARPEN)
+    width, height = image.size
+    if width < 700:
+        ratio = 700 / max(width, 1)
+        image = image.resize((int(width * ratio), int(height * ratio)), Image.Resampling.LANCZOS)
+    text = pytesseract.image_to_string(
+        image,
+        lang=os.getenv("TESSERACT_LANG", "eng+vie"),
+        config=f"--psm {psm}",
+    )
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def ocr_answer_rows_from_pdf_image(image, row_bounds):
+    width, height = image.size
+    x_start = int(width * float(os.getenv("PDF_OPTION_TEXT_X_START_RATIO", "0.26")))
+    x_end = int(width * float(os.getenv("PDF_OPTION_TEXT_X_END_RATIO", "0.84")))
+    options = []
+    for row_start, row_end in row_bounds:
+        y1 = max(0, int(row_start) + 1)
+        y2 = min(height, int(row_end) - 1)
+        if y2 <= y1:
+            options.append("")
+            continue
+        crop = image.crop((x_start, y1, x_end, y2))
+        try:
+            options.append(clean_option_text(ocr_pil_text(crop, psm=6)))
+        except Exception:
+            options.append("")
+    return options
+
+
 def parse_visual_marked_answer_pdf(pdf_path):
     entries = []
     seen_questions = set()
@@ -356,6 +561,8 @@ def parse_visual_marked_answer_pdf(pdf_path):
                     continue
 
                 question_separators.sort()
+                answer_lines = question_separators
+                include_prefirst_for_options = False
                 answer = selected_answer_from_separator_lines(
                     image,
                     question_separators,
@@ -373,6 +580,8 @@ def parse_visual_marked_answer_pdf(pdf_path):
                             end_y,
                             include_prefirst_row=False,
                         )
+                        if answer:
+                            answer_lines = trimmed_separators
                 if not answer:
                     answer = selected_answer_from_separator_lines(
                         image,
@@ -381,14 +590,25 @@ def parse_visual_marked_answer_pdf(pdf_path):
                         end_y,
                         include_prefirst_row=True,
                     )
+                    if answer:
+                        answer_lines = question_separators
+                        include_prefirst_for_options = True
                 if not answer:
                     continue
 
+                row_bounds = build_answer_row_bounds(
+                    answer_lines,
+                    start_y + 20,
+                    end_y,
+                    include_prefirst_row=include_prefirst_for_options,
+                )
+                option_texts = ocr_answer_rows_from_pdf_image(image, row_bounds)
                 entries.append(
                     {
                         "number": number,
                         "question": "",
                         "answer": answer,
+                        "options": option_texts,
                         "source": "visual_marker",
                     }
                 )
@@ -641,19 +861,17 @@ class AutoQuizApp:
         self.is_running = False
 
         self.build_ui()
-        self.log("San sang. Hay bam Set Regions neu chua cau hinh vung.")
+        self.log("San sang. Hay import PDF de co text dap an, roi Run Once/Auto Run.")
 
     def build_ui(self):
         toolbar = tk.Frame(self.root, padx=10, pady=10)
         toolbar.pack(fill=tk.X)
 
-        self.set_button = tk.Button(toolbar, text="Set Regions", command=self.set_regions, width=14)
         self.import_pdf_button = tk.Button(toolbar, text="Import PDF", command=self.import_answer_pdf, width=14)
         self.run_once_button = tk.Button(toolbar, text="Run Once", command=self.run_once, width=14)
         self.auto_button = tk.Button(toolbar, text="Auto Run", command=self.auto_run, width=14)
         self.stop_button = tk.Button(toolbar, text="Stop", command=self.stop_auto, width=14, state=tk.DISABLED)
 
-        self.set_button.pack(side=tk.LEFT, padx=4)
         self.import_pdf_button.pack(side=tk.LEFT, padx=4)
         self.run_once_button.pack(side=tk.LEFT, padx=4)
         self.auto_button.pack(side=tk.LEFT, padx=4)
@@ -674,16 +892,8 @@ class AutoQuizApp:
 
     def config_status_text(self):
         answer_count = len(self.answer_bank.get("entries", [])) if hasattr(self, "answer_bank") else 0
-        answer_text = f" | Answer PDF: {answer_count} muc"
-        regions = self.config.get("regions", {})
-        points = self.config.get("points", {})
-        countdown_text = " | countdown: co" if "countdown" in regions else " | countdown: khong"
-        next_page_text = " | next page: co" if "next_page" in points else " | next page: khong"
-        popup_text = " | popup: co" if "popup" in regions and "popup_click" in points else " | popup: khong"
-        if self.has_required_regions():
-            submit_text = "co Submit/Next" if "submit" in self.config.get("regions", {}) else "khong Submit/Next"
-            return f"Da cau hinh vung bat buoc, {submit_text}.{answer_text}{countdown_text}{next_page_text}{popup_text}"
-        return f"Chua cau hinh du cac vung bat buoc.{answer_text}{countdown_text}{next_page_text}{popup_text}"
+        option_count = sum(1 for entry in self.answer_bank.get("entries", []) if entry.get("options"))
+        return f"Answer PDF: {answer_count} muc | Co text dap an: {option_count} muc | Che do: match dap an tren man hinh."
 
     def load_config(self):
         if not CONFIG_FILE.exists():
@@ -720,6 +930,14 @@ class AutoQuizApp:
     def save_answer_bank(self):
         with ANSWER_BANK_FILE.open("w", encoding="utf-8") as file:
             json.dump(self.answer_bank, file, ensure_ascii=False, indent=2)
+
+    def get_first_answer_bank_number(self):
+        numbers = [
+            entry.get("number")
+            for entry in self.answer_bank.get("entries", [])
+            if isinstance(entry.get("number"), int)
+        ]
+        return min(numbers) if numbers else None
 
     def has_required_regions(self):
         regions = self.config.get("regions", {})
@@ -802,13 +1020,12 @@ class AutoQuizApp:
     def auto_run(self):
         if self.is_running:
             return
-        if not self.has_required_regions():
-            self.log("Loi: Chua cau hinh du vung cau hoi va A/B/C/D.")
-            messagebox.showerror("Thieu cau hinh", "Hay bam Set Regions truoc khi Auto Run.")
-            return
         if not self.answer_bank.get("entries"):
             self.log("Loi: Chua import PDF dap an.")
             messagebox.showerror("Thieu PDF dap an", "Hay bam Import PDF truoc khi Auto Run.")
+            return
+        if not self.has_option_text_entries():
+            messagebox.showerror("Thieu text dap an", "Hay Import PDF lai sau khi cai Tesseract OCR.")
             return
 
         self.stop_event.clear()
@@ -845,55 +1062,49 @@ class AutoQuizApp:
             self.log(f"Loi: {exc}")
 
     def process_once(self):
-        if not self.has_required_regions():
-            raise RuntimeError("Chua cau hinh du vung cau hoi va A/B/C/D.")
         if not self.answer_bank.get("entries"):
             raise RuntimeError("Chua import PDF dap an. Hay bam Import PDF truoc khi chay.")
+        if not self.has_option_text_entries():
+            raise RuntimeError("Answer bank chua co text dap an. Hay Import PDF lai sau khi cai Tesseract OCR.")
 
-        regions = self.config["regions"]
-        points = self.config.get("points", {})
-        if self.is_popup_visible(regions):
-            if "popup_click" not in points:
-                self.log("Phat hien popup nhung chua cau hinh diem click popup.")
-                return
-            self.click_point(points["popup_click"], "Popup")
-            time.sleep(0.5)
-            return
+        screenshot = pyautogui.screenshot()
+        radio_centers = find_radio_centers(screenshot)
+        if not radio_centers:
+            raise RuntimeError("Khong tim thay cac nut tron dap an tren man hinh.")
 
-        if self.is_countdown_expired(regions):
-            if "next_page" not in points:
-                self.log("Countdown da het nhung chua cau hinh diem nut trang ke tiep.")
-                return
-            self.click_point(points["next_page"], "Trang ke tiep")
-            time.sleep(0.8)
-            return
+        screen_options = self.ocr_screen_options(screenshot, radio_centers)
+        self.log("Dap an OCR tren man hinh:")
+        for index, text in enumerate(screen_options, start=1):
+            self.log(f"{index}. {text or '[rong]'}")
 
-        question_text = self.ocr_region(regions["question"])
-        texts = {
-            "question": question_text,
-            "A": self.ocr_region_safe(regions["A"], "A"),
-            "B": self.ocr_region_safe(regions["B"], "B"),
-            "C": self.ocr_region_safe(regions["C"], "C"),
-            "D": self.ocr_region_safe(regions["D"], "D"),
-        }
+        matched_entry, match_score = self.find_answer_by_screen_options(screen_options)
+        if not matched_entry:
+            raise RuntimeError("Khong tim thay cau khop trong PDF theo cac dap an tren man hinh.")
 
-        self.log("Cau hoi OCR:")
-        self.log(texts["question"] or "[rong]")
-        for key in ["A", "B", "C", "D"]:
-            self.log(f"Dap an {key}: {texts[key] or '[rong]'}")
+        answer = matched_entry["answer"]
+        answer_index = ANSWER_INDEX[answer]
+        if answer_index >= len(radio_centers):
+            raise RuntimeError(
+                f"Dap an {answer} can vi tri {answer_index + 1}, "
+                f"nhung man hinh chi tim thay {len(radio_centers)} lua chon."
+            )
 
-        if not texts["question"]:
-            raise RuntimeError("OCR khong doc duoc cau hoi, khong the so sanh voi PDF.")
+        selected_point = radio_centers[answer_index]
+        self.log(
+            f"Khớp PDF câu {matched_entry.get('number')} "
+            f"(score {match_score:.2f}): dap an {answer}, click lua chon thu {answer_index + 1}."
+        )
+        self.click_xy(selected_point[0], selected_point[1], f"Dap an {answer}")
+        time.sleep(0.35)
 
-        answer = self.find_answer_in_bank(texts)
-        if not answer:
-            raise RuntimeError("Khong tim thay dap an trong PDF cho cau hoi hien tai.")
-        self.log(f"PDF answer bank chon: {answer}")
+        screenshot_after_answer = pyautogui.screenshot()
+        below_y = max(point[1] for point in radio_centers) + 20
+        next_button = find_blue_button_center(screenshot_after_answer, below_y=below_y)
+        if not next_button:
+            raise RuntimeError("Khong tim thay nut Tiep mau xanh sau khi chon dap an.")
 
-        self.click_region(regions[answer], f"Dap an {answer}")
-        if "submit" in regions:
-            time.sleep(0.25)
-            self.click_region(regions["submit"], "Submit/Next")
+        self.click_xy(next_button[0], next_button[1], "Tiep")
+        time.sleep(0.8)
 
     def is_popup_visible(self, regions):
         if "popup" not in regions:
@@ -936,6 +1147,73 @@ class AutoQuizApp:
             return False
         self.log(f"Countdown con lai: {seconds} giay.")
         return seconds <= 0
+
+    def has_option_text_entries(self):
+        return any(entry.get("options") for entry in self.answer_bank.get("entries", []))
+
+    def ocr_screen_options(self, screenshot, radio_centers):
+        width, height = screenshot.size
+        option_texts = []
+        if len(radio_centers) >= 2:
+            median_gap = sorted(
+                radio_centers[index + 1][1] - radio_centers[index][1]
+                for index in range(len(radio_centers) - 1)
+            )[len(radio_centers) // 2 - 1]
+        else:
+            median_gap = 48
+
+        x_start = min(width - 1, max(0, radio_centers[0][0] + 22))
+        x_end = int(width * float(os.getenv("SCREEN_OPTION_TEXT_X_END_RATIO", "0.82")))
+        x_end = max(x_start + 50, min(x_end, width))
+
+        for index, (radio_x, radio_y) in enumerate(radio_centers):
+            if index == 0:
+                y_start = int(radio_y - median_gap * 0.45)
+            else:
+                y_start = int((radio_centers[index - 1][1] + radio_y) / 2)
+
+            if index + 1 < len(radio_centers):
+                y_end = int((radio_y + radio_centers[index + 1][1]) / 2)
+            else:
+                y_end = int(radio_y + median_gap * 0.75)
+
+            y_start = max(0, y_start)
+            y_end = min(height, max(y_start + 20, y_end))
+            crop = screenshot.crop((x_start, y_start, x_end, y_end))
+            text = clean_option_text(ocr_pil_text(crop, psm=6))
+            option_texts.append(text)
+        return option_texts
+
+    def find_answer_by_screen_options(self, screen_options):
+        best_entry = None
+        best_score = 0.0
+        screen_options = [clean_option_text(option) for option in screen_options]
+
+        for entry in self.answer_bank.get("entries", []):
+            bank_options = [clean_option_text(option) for option in entry.get("options", [])]
+            pair_count = min(len(screen_options), len(bank_options))
+            if pair_count < 2:
+                continue
+
+            pair_scores = []
+            for index in range(pair_count):
+                pair_scores.append(similarity_score(screen_options[index], bank_options[index]))
+
+            useful_scores = [score for score in pair_scores if score > 0]
+            if len(useful_scores) < max(2, pair_count - 1):
+                continue
+
+            score = sum(pair_scores) / pair_count
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+
+        threshold = float(os.getenv("SCREEN_OPTION_MATCH_THRESHOLD", "0.58"))
+        if best_entry and best_score >= threshold:
+            return best_entry, best_score
+        if best_entry:
+            self.log(f"Ung vien PDF gan nhat cau {best_entry.get('number')} score {best_score:.2f}, chua du nguong.")
+        return None, best_score
 
     def find_answer_in_bank(self, texts):
         entries = self.answer_bank.get("entries", [])
@@ -1017,6 +1295,15 @@ class AutoQuizApp:
             self.log(f"Click {label}: that bai - {exc}")
             raise
 
+    def click_xy(self, x, y, label):
+        try:
+            pyautogui.moveTo(x=x, y=y, duration=0.12)
+            pyautogui.click(button="left")
+            self.log(f"Click {label}: thanh cong tai ({x}, {y}).")
+        except Exception as exc:
+            self.log(f"Click {label}: that bai - {exc}")
+            raise
+
     def click_point(self, point, label):
         try:
             x = int(point["x"])
@@ -1029,7 +1316,6 @@ class AutoQuizApp:
             raise
 
     def set_running_buttons(self, running):
-        self.set_button.config(state=tk.DISABLED if running else tk.NORMAL)
         self.import_pdf_button.config(state=tk.DISABLED if running else tk.NORMAL)
         self.run_once_button.config(state=tk.DISABLED if running else tk.NORMAL)
         self.auto_button.config(state=tk.DISABLED if running else tk.NORMAL)
